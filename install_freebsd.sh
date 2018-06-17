@@ -12,6 +12,7 @@ make build && make install
 make bootstrap
 luarocks install lua-resty-session
 luarocks install lua-resty-string
-fetch https://raw.githubusercontent.com/openresty/lua-resty-lock/master/lib/resty/lock.lua -o /usr/local/share/lua/5.1/resty/lock.lua
+luarocks install lua-resty-http
+luarocks install lua-resty-lock
 cd -
 rm -r /tmp/installlua

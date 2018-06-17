@@ -3,6 +3,7 @@ local oauth_client_id = ngx.var.oauth_client_id
 local oauth_client_secret = ngx.var.oauth_client_secret
 local oauth_callback = ngx.escape_uri(ngx.var.oauth_callback)
 local oauth_server  = ngx.var.oauth_server
+local apihost = ngx.var.apihost
 local method = ngx.var.request_method
 local getmetatable = getmetatable
 local ffi          = require "ffi"
@@ -16,14 +17,15 @@ ngx.log(level, package.path)
 local emails       = require "emails" 
 local hour         = 3600
 
-ffi_cdef[[
-typedef unsigned char u_char;
-int RAND_bytes(u_char *buf, int num);
-]]
-
-local t = ffi_typeof "uint8_t[?]"
-
 local function random(len)
+    if not isCDEF then
+        ffi_cdef[[
+        typedef unsigned char u_char;
+        int RAND_bytes(u_char *buf, int num);
+        ]]
+        isCDEF = true
+    end
+    local t = ffi_typeof "uint8_t[?]"
     local s = ffi_new(t, len)
     C.RAND_bytes(s, len)
     return ffi_str(s, len)
@@ -32,6 +34,7 @@ ngx.log(level, ngx.var.uri)
 
 
 local session = require "resty.session".open()
+local http = require "resty.http"
 local temp = ngx.shared.temp
 ngx.log(level, "get: "..ngx.encode_base64(ngx.var.cookie_session))
 local auth
@@ -52,10 +55,23 @@ local allow = true
 
 function get_email()
     ngx.log(level, "get_email...")
-    local res = ngx.location.capture(
-        '/_oauth_server_email',
-        { args = { access_token = session.data.access_token } }
-    )
+    local httpc = http.new()
+    local res, err = httpc:request_uri("https://"..apihost.."/plus/v1/people/me", {
+        method = "GET",
+        query = { access_token = session.data.access_token },
+        headers = {
+            ["Content-Type"] = "application/x-www-form-urlencoded",
+        }
+    })
+    if err then
+        session:destroy()
+        ngx.log(level, "status: 503, error: "..err)
+        ngx.status = res.status
+        ngx.header["Content-Type"] = "application/json; charset=utf-8"
+        ngx.say("{\"status\": 503, \"error\": \""..err.."\"}")
+        allow = false
+        return
+    end
     if res.status ~= 200 then
         session:destroy()
         ngx.log(level, "status: "..res.status..", error: "..ngx.re.gsub(res.body, "\"", "\\\""))
@@ -65,8 +81,7 @@ function get_email()
         allow = false
         return
     end
-    local content = res.body
-    local result_dict = require "cjson".decode(content)
+    local result_dict = require "cjson".decode(res.body)
     for key, value in pairs(result_dict.emails) do
         ngx.log(level, key)
         ngx.log(level, value.value)
@@ -78,10 +93,23 @@ end
 function get_access_token()
     ngx.log(level, "get_access_token...")
     session:start()
-    local res = ngx.location.capture(
-        '/_oauth_server',
-        { method = ngx.HTTP_POST, body = "client_id="..oauth_client_id.."&client_secret="..oauth_client_secret.."&code="..session.data.auth_token.."&grant_type=authorization_code&redirect_uri="..oauth_callback }
-    )
+    local httpc = http.new()
+    local res, err = httpc:request_uri("https://"..apihost.."/oauth2/v4/token", {
+        method = "POST",
+        body = "client_id="..oauth_client_id.."&client_secret="..oauth_client_secret.."&code="..session.data.auth_token.."&grant_type=authorization_code&redirect_uri="..oauth_callback,
+        headers = {
+            ["Content-Type"] = "application/x-www-form-urlencoded",
+        }
+    })
+    if err then
+        session:destroy()
+        ngx.log(level, "status: 503, error: "..err)
+        ngx.status = res.status
+        ngx.header["Content-Type"] = "application/json; charset=utf-8"
+        ngx.say("{\"status\": 503, \"error\": \""..err.."\"}")
+        allow = false
+        return
+    end
     if res.status ~= 200 then
         session:destroy()
         ngx.status = res.status
@@ -91,8 +119,7 @@ function get_access_token()
         allow = false
         return
     end
-    local content = res.body
-    local result_dict = require "cjson".decode(content)
+    local result_dict = require "cjson".decode(res.body)
     session.data.access_token = result_dict.access_token
     session.data.token_type = result_dict.token_type
     user = get_email()
@@ -120,7 +147,7 @@ function get_auth_token()
         ngx.status = ngx.HTTP_UNAUTHORIZED
         ngx.say("{\"status\": 401, \"message\": \"session uknown or expired\"}")
         allow = false
-        return
+        return ngx.exit(ngx.OK)
     end
     return "/login?next="..ngx.escape_uri(ngx.var.uri)
 --[[    if session.data.sended and session.data.sended > ngx.now() then
@@ -152,11 +179,24 @@ function update_access_token()
     end
     ngx.log(level, "refresh_token: "..session.data.refresh_token)
     session:start()
+    local httpc = http.new()
     ngx.log(level, "start update")
-    local res = ngx.location.capture(
-        '/_oauth_server',
-        { method = ngx.HTTP_POST, body = "client_id="..oauth_client_id.."&client_secret="..oauth_client_secret.."&refresh_token="..session.data.refresh_token.."&grant_type=refresh_token&redirect_uri="..oauth_callback }
-    )
+    local res, err = httpc:request_uri("https://"..apihost.."/oauth2/v4/token", {
+        method = ngx.HTTP_POST,
+        body = "client_id="..oauth_client_id.."&client_secret="..oauth_client_secret.."&refresh_token="..session.data.refresh_token.."&grant_type=refresh_token&redirect_uri="..oauth_callback, 
+        headers = {
+            ["Content-Type"] = "application/x-www-form-urlencoded",
+        }
+    })
+    if err then
+        session:destroy()
+        ngx.log(level, "status: 503, error: "..err)
+        ngx.status = res.status
+        ngx.header["Content-Type"] = "application/json; charset=utf-8"
+        ngx.say("{\"status\": 503, \"error\": \""..err.."\"}")
+        allow = false
+        return
+    end
     ngx.log(level, "refresh status: "..res.status)
     if res.status ~= 200 then
         session:destroy()
@@ -166,8 +206,7 @@ function update_access_token()
         allow = false
         return
     end
-    local content = res.body
-    local result_dict = require "cjson".decode(content)
+    local result_dict = require "cjson".decode(res.body)
     session.data.access_token = result_dict.access_token
     session.data.token_type = result_dict.token_type
     session.data.expires_at = result_dict.expires_in + ngx.now()
@@ -223,7 +262,8 @@ if not auth or not auth.token then
         ngx.log(level, "save: true")
         session:save()
     end
-    if not emails[session.data.user] then
+
+    if not emails[session.data.user] and allow then
         ngx.header["Content-Type"] = "application/json; charset=utf-8"
         ngx.status = ngx.HTTP_UNAUTHORIZED                                                                       
         ngx.say("{\"status\": 401, \"message\": \"user not allowed\"}")
